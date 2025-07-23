@@ -11,7 +11,15 @@ const int NUM_BUTTONS = 5;
 
 RTC_DATA_ATTR int bootCount = 0;
 const unsigned long ACTIVE_TIMEOUT = 30000;
+const unsigned long DEBOUNCE_DELAY = 10;
 unsigned long lastButtonPress = 0;
+unsigned long buttonLastPress[5] = {0}; // Debounce timing for each button
+bool buttonState[5] = {HIGH, HIGH, HIGH, HIGH, HIGH}; // Track current state
+bool lastButtonState[5] = {HIGH, HIGH, HIGH, HIGH, HIGH}; // Track previous state
+bool buttonTriggered[5] = {false, false, false, false, false}; // Track if button has been triggered
+
+// Note: BleKeyboard library doesn't support custom callbacks
+// Connection state is tracked via bleKeyboard.isConnected()
 
 void setupDeepSleep() {
     // Configure individual button pins
@@ -59,45 +67,88 @@ void setup() {
     
     Serial.println("INITIALIZING - Starting BLE keyboard...");
     bleKeyboard.begin();
+    
     lastButtonPress = millis();
     
     Serial.println("=== 5-BUTTON DIODE-WAKE TRACKBALL MOD READY ===");
 }
 
 void loop() {
-    // Check all 5 buttons individually
+    // Check all 5 buttons individually with press-on-down and repeat lockout
     for (int i = 0; i < NUM_BUTTONS; i++) {
-        if (digitalRead(BUTTON_PINS[i]) == LOW) {
-            lastButtonPress = millis();
-            
-            if (bleKeyboard.isConnected()) {
-                char keyNumber = '1' + i;
-                Serial.printf("Button %d (GPIO %d) -> Ctrl+Shift+%c\n", i+1, BUTTON_PINS[i], keyNumber);
+        // Read current button state
+        bool currentReading = digitalRead(BUTTON_PINS[i]);
+        
+        // Always detect state changes immediately
+        if (currentReading != lastButtonState[i]) {
+            // State has changed - check if enough time has passed for debouncing
+            if ((millis() - buttonLastPress[i]) > DEBOUNCE_DELAY) {
+                buttonLastPress[i] = millis(); // Reset debounce timer
                 
-                // bleKeyboard.press(KEY_LEFT_CTRL);
-                // bleKeyboard.press(KEY_LEFT_SHIFT);
-                bleKeyboard.press(keyNumber);
-                delay(20);
-                bleKeyboard.releaseAll();
+                // Update the button state
+                buttonState[i] = currentReading;
+                
+                // Trigger action on button PRESS (transition from HIGH to LOW)
+                // But only if we haven't already triggered for this press cycle
+                if (lastButtonState[i] == HIGH && buttonState[i] == LOW && !buttonTriggered[i]) {
+                    buttonTriggered[i] = true; // Lock out further triggers
+                    lastButtonPress = millis(); // Update activity timer
+                    
+                    if (bleKeyboard.isConnected()) {
+                        char keyNumber = '1' + i;
+                        Serial.printf("Button %d (GPIO %d) PRESSED -> Key '%c'\n", i+1, BUTTON_PINS[i], keyNumber);
+                        
+                        // Commented out for testing - uncomment when ready for modifier keys
+                        // bleKeyboard.press(KEY_LEFT_CTRL);
+                        // bleKeyboard.press(KEY_LEFT_SHIFT);
+                        bleKeyboard.press(keyNumber);
+                        // delay(20);
+                        bleKeyboard.releaseAll();
+                    } else {
+                        Serial.printf("Button %d pressed but BLE not connected\n", i+1);
+                    }
+                }
+                
+                // Reset the trigger lock when button is released
+                if (lastButtonState[i] == LOW && buttonState[i] == HIGH) {
+                    buttonTriggered[i] = false; // Ready for next press
+                }
+                
+                // Update the last button state after processing
+                lastButtonState[i] = currentReading;
             }
-            
-            delay(200);
+            // If debounce time hasn't passed, we ignore this change (but keep checking)
         }
     }
     
+    // Check for sleep timeout
     unsigned long timeSinceLastButton = millis() - lastButtonPress;
     if (timeSinceLastButton >= ACTIVE_TIMEOUT) {
         goToDeepSleep();
     }
     
+    // Status reporting every 5 seconds with connection state tracking
     static unsigned long lastStatus = 0;
+    static bool wasConnected = false;
+    bool isConnected = bleKeyboard.isConnected();
+    
+    // Log connection state changes
+    if (isConnected != wasConnected) {
+        if (isConnected) {
+            Serial.println("BLE: Device connected");
+        } else {
+            Serial.println("BLE: Device disconnected");
+        }
+        wasConnected = isConnected;
+    }
+    
     if (millis() - lastStatus > 5000) {
         unsigned long timeToSleep = ACTIVE_TIMEOUT - timeSinceLastButton;
         Serial.printf("BLE: %s, Sleep in: %d seconds\n", 
-                      bleKeyboard.isConnected() ? "Connected" : "Disconnected",
+                      isConnected ? "Connected" : "Disconnected",
                       (int)(timeToSleep/1000));
         lastStatus = millis();
     }
     
-    delay(100);
+    delay(1);
 }
