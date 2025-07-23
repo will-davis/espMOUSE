@@ -1,75 +1,103 @@
 #include <Arduino.h>
 #include <BleKeyboard.h>
+#include <esp_sleep.h>
 
-BleKeyboard bleKeyboard("Trackball-Keys", "CustomMod", 100);
+BleKeyboard bleKeyboard("Trackball-KB", "CustomMod", 100);
 
-// Working GPIO pins
-const int BUTTON_PINS[9] = {2, 4, 5, 12, 13, 14, 19, 17, 18};
-bool lastButtonState[9] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
-bool buttonPressed[9] = {false, false, false, false, false, false, false, false, false};
-unsigned long lastDebounceTime[9] = {0};
-const unsigned long DEBOUNCE_DELAY = 50;
+// Individual button pins
+const int BUTTON_PINS[5] = {2, 4, 12, 13, 14};
+const int MASTER_WAKE_PIN = 15; // All buttons also connect here through diodes
+const int NUM_BUTTONS = 5;
+
+RTC_DATA_ATTR int bootCount = 0;
+const unsigned long ACTIVE_TIMEOUT = 30000;
+unsigned long lastButtonPress = 0;
+
+void setupDeepSleep() {
+    // Configure individual button pins
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+    }
+    
+    // Configure master wake pin
+    pinMode(MASTER_WAKE_PIN, INPUT_PULLUP);
+    
+    // Only the master wake pin needs to wake the device
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)MASTER_WAKE_PIN, 0);
+    
+    Serial.printf("Wake-up configured: Any button press wakes via GPIO %d\n", MASTER_WAKE_PIN);
+}
+
+void goToDeepSleep() {
+    Serial.println("=== GOING TO DEEP SLEEP ===");
+    Serial.println("Press ANY button to wake up!");
+    Serial.flush();
+    
+    bleKeyboard.end();
+    delay(500);
+    
+    esp_deep_sleep_start();
+}
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    // Setup all button pins with pullups
-    for (int i = 0; i < 9; i++) {
-        pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+    setCpuFrequencyMhz(80);
+    
+    bootCount++;
+    Serial.printf("\n=== BOOT #%d ===\n", bootCount);
+    
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+        Serial.println("Wake up: Button press detected!");
+    } else {
+        Serial.println("Wake up: First boot or reset");
     }
     
-    Serial.println("Starting 9-button keyboard mod...");
+    setupDeepSleep();
+    
+    Serial.println("INITIALIZING - Starting BLE keyboard...");
     bleKeyboard.begin();
-    Serial.println("Buttons send Ctrl+Shift+1 through Ctrl+Shift+9");
+    lastButtonPress = millis();
+    
+    Serial.println("=== 5-BUTTON DIODE-WAKE TRACKBALL MOD READY ===");
 }
 
 void loop() {
-    //Checking power consumption
-    //Serial.printf("CPU Freq: %dMHz, Free heap: %d\n", getCpuFrequencyMhz(), ESP.getFreeHeap());
-    if (bleKeyboard.isConnected()) {
-        // Check each button
-        for (int i = 0; i < 9; i++) {
-            bool currentState = digitalRead(BUTTON_PINS[i]);
+    // Check all 5 buttons individually
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        if (digitalRead(BUTTON_PINS[i]) == LOW) {
+            lastButtonPress = millis();
             
-            // Debounce logic
-            if (currentState != lastButtonState[i]) {
-                lastDebounceTime[i] = millis();
+            if (bleKeyboard.isConnected()) {
+                char keyNumber = '1' + i;
+                Serial.printf("Button %d (GPIO %d) -> Ctrl+Shift+%c\n", i+1, BUTTON_PINS[i], keyNumber);
+                
+                // bleKeyboard.press(KEY_LEFT_CTRL);
+                // bleKeyboard.press(KEY_LEFT_SHIFT);
+                bleKeyboard.press(keyNumber);
+                delay(20);
+                bleKeyboard.releaseAll();
             }
             
-            if ((millis() - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
-                // Button was just pressed (went from HIGH to LOW)
-                if (currentState == LOW && !buttonPressed[i]) {
-                    buttonPressed[i] = true;
-                    
-                    // Send Ctrl+Shift+(1-9)
-                    char keyNumber = '1' + i;
-                    
-                    Serial.printf("Button %d (GPIO %d) -> Ctrl+Shift+%c\n", 
-                                  i+1, BUTTON_PINS[i], keyNumber);
-                    
-                    // bleKeyboard.press(KEY_LEFT_CTRL);
-                    // bleKeyboard.press(KEY_LEFT_SHIFT);
-                    bleKeyboard.press(keyNumber);
-                    delay(20); // Brief hold
-                    bleKeyboard.releaseAll();
-                }
-                // Button was released (went from LOW to HIGH)
-                else if (currentState == HIGH && buttonPressed[i]) {
-                    buttonPressed[i] = false;
-                    Serial.printf("Button %d released\n", i+1);
-                }
-            }
-            
-            lastButtonState[i] = currentState;
-        }
-    } else {
-        static unsigned long lastMessage = 0;
-        if (millis() - lastMessage > 5000) {
-            Serial.println("Waiting for BLE connection...");
-            lastMessage = millis();
+            delay(200);
         }
     }
     
-    delay(10);
+    unsigned long timeSinceLastButton = millis() - lastButtonPress;
+    if (timeSinceLastButton >= ACTIVE_TIMEOUT) {
+        goToDeepSleep();
+    }
+    
+    static unsigned long lastStatus = 0;
+    if (millis() - lastStatus > 5000) {
+        unsigned long timeToSleep = ACTIVE_TIMEOUT - timeSinceLastButton;
+        Serial.printf("BLE: %s, Sleep in: %d seconds\n", 
+                      bleKeyboard.isConnected() ? "Connected" : "Disconnected",
+                      (int)(timeToSleep/1000));
+        lastStatus = millis();
+    }
+    
+    delay(100);
 }
